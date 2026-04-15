@@ -83,7 +83,7 @@ The Xbox 360 save format differs from Win64 in several ways:
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+GNU GPLv3 License - see [LICENSE](LICENSE) for details.
 
 The included DLLs have their own licenses:
 - `LZXDecompression.dll` - see [GoobyCorp/Xbox-360-Crypto](https://github.com/GoobyCorp/Xbox-360-Crypto)
