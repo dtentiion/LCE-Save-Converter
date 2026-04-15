@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+_test_out/
+*.obj
+*.lib
+*.exp
