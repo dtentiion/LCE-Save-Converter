@@ -4,6 +4,8 @@ Converts Xbox 360 Minecraft Legacy Console Edition save files (.bin STFS CON con
 
 All world data is preserved - terrain, chests, items, signs, maps, player inventories, Nether/End dimensions.
 
+![Screenshot](media/screenshot.png)
+
 ## How it works
 
 The tool handles the entire pipeline:
