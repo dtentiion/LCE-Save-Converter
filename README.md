@@ -6,6 +6,8 @@ All world data is preserved - terrain, chests, items, signs, maps, player invent
 
 ![Screenshot](media/screenshot.png)
 
+[Watch the demo video](media/demo.mp4)
+
 ## How it works
 
 The tool handles the entire pipeline:
