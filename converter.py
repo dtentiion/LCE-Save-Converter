@@ -581,9 +581,7 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
     dst.mkdir(parents=True, exist_ok=True)
 
     (dst / 'saveData.ms').write_bytes(win64)
-    (dst / 'worldname.txt').write_text(name, encoding='utf-8')
     out("  saveData.ms  [ok]")
-    out("  worldname.txt [ok]")
 
     thumb = pkg.thumbnail
     if thumb:
