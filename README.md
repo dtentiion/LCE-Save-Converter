@@ -52,12 +52,13 @@ The tool outputs saves in the standard Win64 LCE format:
 ```
 GameHDD/
   <save folder>/
-    saveData.ms       - the converted save (this is the only file the game reads)
-    worldname.txt     - world name displayed on the load screen (optional, for your reference)
-    thumbnail.png     - save thumbnail (optional, for your reference)
+    saveData.ms                    - the converted save data
+    worldname.txt                  - world name displayed on the load screen
+    thumbnails/
+      thumbData.png                - save thumbnail shown in the world list and detail view
 ```
 
-Only `saveData.ms` is required. The `.txt` and `.png` are there so you can identify which save is which - the game itself only looks at the `.ms` file.
+The thumbnail lives in a `thumbnails` subfolder as `thumbData.png` to match where the game's storage library looks for it after the 4JLibs upgrade.
 
 ## Tested
 

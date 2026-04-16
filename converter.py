@@ -587,8 +587,9 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
 
     thumb = pkg.thumbnail
     if thumb:
-        (dst / 'thumbnail.png').write_bytes(thumb)
-        out("  thumbnail.png [ok]")
+        (dst / 'thumbnails').mkdir(exist_ok=True)
+        (dst / 'thumbnails' / 'thumbData.png').write_bytes(thumb)
+        out("  thumbnails/thumbData.png [ok]")
 
     out(f"\nInstalled!  ->  {dst}")
     return str(dst)
