@@ -1,10 +1,12 @@
 """
 Minecraft LCE Save Manager - GUI
-Converts Xbox 360 (.bin STFS CON) save files to Windows64 LCE format.
+Converts Xbox 360 (.bin STFS CON) and PS3 (GAMEDATA folder) save files
+to Windows64 LCE format.
 
 Usage:
     python save_manager.py                   # GUI
-    python save_manager.py save.bin          # preload a file
+    python save_manager.py save.bin          # preload a 360 file
+    python save_manager.py <ps3_folder>      # preload a PS3 save folder
 """
 
 import sys
@@ -25,6 +27,25 @@ import customtkinter as ctk
 from tkinter import filedialog
 
 from converter import convert_bin_to_win64
+from converter_ps3 import convert_ps3_to_win64
+
+
+# Detected save types
+KIND_XBOX = 'xbox'
+KIND_PS3  = 'ps3'
+
+
+def detect_save_kind(path: str) -> str | None:
+    """
+    Figure out what was dropped. Returns 'xbox', 'ps3', or None if the
+    path isn't a recognisable save.
+    """
+    p = Path(path)
+    if p.is_file() and p.suffix.lower() == '.bin':
+        return KIND_XBOX
+    if p.is_dir() and (p / 'GAMEDATA').is_file():
+        return KIND_PS3
+    return None
 
 # -- theme --
 ctk.set_appearance_mode("dark")
@@ -52,8 +73,22 @@ FONT_MONO   = ("Consolas", 10)
 # Widgets
 # =============================================================================
 
+def _path_size(path: str) -> int:
+    """Total byte size - file size, or sum of files in a folder."""
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
 class DropZone(ctk.CTkFrame):
-    """A card the user can click or drag a .bin file onto."""
+    """A card the user can click or drag a .bin file / PS3 save folder onto."""
 
     def __init__(self, master, on_file, **kw):
         super().__init__(master,
@@ -64,21 +99,25 @@ class DropZone(ctk.CTkFrame):
                          **kw)
         self._on_file = on_file
         self._file    = None
+        self._kind    = None
 
         self._icon = ctk.CTkLabel(self, text="[folder]", font=("Segoe UI Emoji", 32))
         self._icon.pack(pady=(22, 4))
 
         self._hint = ctk.CTkLabel(
             self,
-            text="Drop your .bin file here",
+            text="Drop a .bin file (Xbox 360) or a save folder (PS3)",
             font=FONT_BODY,
             text_color=C_SUBTEXT,
         )
         self._hint.pack()
 
-        self._btn = ctk.CTkButton(
-            self,
-            text="Browse for .bin file",
+        btn_row = ctk.CTkFrame(self, fg_color='transparent')
+        btn_row.pack(pady=(10, 22))
+
+        self._btn_bin = ctk.CTkButton(
+            btn_row,
+            text="Browse .bin",
             font=FONT_BODY,
             fg_color=C_SURFACE,
             hover_color=C_STROKE,
@@ -86,10 +125,25 @@ class DropZone(ctk.CTkFrame):
             border_width=1,
             border_color=C_STROKE,
             corner_radius=6,
-            width=180,
-            command=self._browse,
+            width=130,
+            command=self._browse_bin,
         )
-        self._btn.pack(pady=(10, 22))
+        self._btn_bin.pack(side='left', padx=(0, 6))
+
+        self._btn_folder = ctk.CTkButton(
+            btn_row,
+            text="Browse PS3 folder",
+            font=FONT_BODY,
+            fg_color=C_SURFACE,
+            hover_color=C_STROKE,
+            text_color=C_TEXT,
+            border_width=1,
+            border_color=C_STROKE,
+            corner_radius=6,
+            width=160,
+            command=self._browse_folder,
+        )
+        self._btn_folder.pack(side='left')
 
         if _HAS_DND:
             self.drop_target_register(DND_FILES)
@@ -98,23 +152,30 @@ class DropZone(ctk.CTkFrame):
             self.dnd_bind('<<DragLeave>>', self._drag_leave)
 
         for w in (self, self._icon, self._hint):
-            w.bind('<Button-1>', lambda _e: self._browse())
+            w.bind('<Button-1>', lambda _e: self._browse_bin())
 
-    def _browse(self):
+    def _browse_bin(self):
         p = filedialog.askopenfilename(
             title="Select Xbox 360 Minecraft LCE save",
             filetypes=[("Xbox 360 saves", "*.bin"), ("All files", "*.*")],
         )
         if p:
-            self._set_file(p)
+            self._set_path(p)
+
+    def _browse_folder(self):
+        p = filedialog.askdirectory(
+            title="Select PS3 save folder (contains GAMEDATA, PARAM.SFO, THUMB)",
+        )
+        if p:
+            self._set_path(p)
 
     def _on_drop(self, event):
         self.configure(fg_color=C_DROP_IDLE)
         raw = event.data.strip()
         if raw.startswith('{') and raw.endswith('}'):
             raw = raw[1:-1]
-        if os.path.isfile(raw):
-            self._set_file(raw)
+        if os.path.exists(raw):
+            self._set_path(raw)
 
     def _drag_enter(self, _e):
         self.configure(fg_color=C_DROP_HOV, border_color=C_ACCENT)
@@ -122,17 +183,35 @@ class DropZone(ctk.CTkFrame):
     def _drag_leave(self, _e):
         self.configure(fg_color=C_DROP_IDLE, border_color=C_STROKE)
 
-    def _set_file(self, path: str):
+    def _set_path(self, path: str):
+        kind = detect_save_kind(path)
+        if kind is None:
+            self._hint.configure(
+                text=f"Not recognised: {Path(path).name}",
+                text_color=C_WARN_FG,
+            )
+            self._icon.configure(text="[!]")
+            self.configure(border_color=C_STROKE)
+            self._file = None
+            self._kind = None
+            self._on_file(None, None)
+            return
+
         self._file = path
-        sz = os.path.getsize(path)
-        label = f"{Path(path).name}  ({sz / 1_048_576:.1f} MB)"
+        self._kind = kind
+        sz = _path_size(path)
+        tag = "Xbox 360" if kind == KIND_XBOX else "PS3"
+        label = f"[{tag}]  {Path(path).name}  ({sz / 1_048_576:.1f} MB)"
         self._hint.configure(text=label, text_color=C_TEXT)
         self._icon.configure(text="[ok]")
         self.configure(border_color=C_ACCENT)
-        self._on_file(path)
+        self._on_file(path, kind)
 
     @property
     def file(self): return self._file
+
+    @property
+    def kind(self): return self._kind
 
 
 # =============================================================================
@@ -152,7 +231,8 @@ def _make_root():
 class SaveManagerApp:
     def __init__(self):
         self.root = _make_root()
-        self._bin_path  = None
+        self._save_path = None
+        self._save_kind = None
         self._game_dir  = None
         self._running   = False
         self._build_ui()
@@ -160,7 +240,7 @@ class SaveManagerApp:
     def _build_ui(self):
         r = self.root
         r.title("Minecraft LCE Save Manager")
-        r.geometry("680x720")
+        r.geometry("680x740")
         r.resizable(False, False)
         r.configure(bg=C_BG)
 
@@ -177,7 +257,7 @@ class SaveManagerApp:
             font=("Segoe UI", 22), text_color=C_SUBTEXT,
         ).pack(side='left', padx=(6, 0))
         ctk.CTkLabel(
-            header, text="Xbox 360 -> Windows 64",
+            header, text="Xbox 360 / PS3 -> Windows 64",
             font=FONT_SMALL, text_color=C_SUBTEXT,
         ).pack(side='right', pady=(8, 0))
 
@@ -189,15 +269,16 @@ class SaveManagerApp:
         banner.pack(fill='x', padx=28, pady=(16, 0))
         ctk.CTkLabel(
             banner,
-            text="[!]  TU19 or older saves are recommended.  "
-                 "Later saves may not load correctly in the TU19 dev build.",
+            text="[!]  TU19 or older (Xbox 360) and 1.12 or older (PS3) saves are recommended.  "
+                 "Newer saves may not load correctly in the TU19 dev build - both platforms share "
+                 "the same game version cutoff.",
             font=FONT_SMALL, text_color=C_WARN_FG,
             wraplength=600, justify='left',
         ).pack(padx=14, pady=8, anchor='w')
 
-        # section 1: bin file
-        self._section_label(r, "1   XBOX 360 SAVE FILE  (.bin)")
-        self._drop = DropZone(r, on_file=self._on_bin_selected, height=140)
+        # section 1: save source
+        self._section_label(r, "1   SAVE SOURCE  (Xbox .bin  or  PS3 folder)")
+        self._drop = DropZone(r, on_file=self._on_save_selected, height=160)
         self._drop.pack(fill='x', padx=28)
         self._bin_status = ctk.CTkLabel(r, text="", font=FONT_SMALL, text_color=C_SUBTEXT)
         self._bin_status.pack(anchor='w', padx=30, pady=(4, 0))
@@ -251,7 +332,7 @@ class SaveManagerApp:
             text_color="#b0c8d8", state='disabled', height=160,
         )
         self._log.pack(fill='both', expand=True, padx=28, pady=(0, 24))
-        self._log_write("Ready.  Drop a .bin file above to get started.\n")
+        self._log_write("Ready.  Drop a .bin file or a PS3 save folder above to get started.\n")
 
     def _section_label(self, parent, text: str):
         ctk.CTkLabel(
@@ -261,13 +342,21 @@ class SaveManagerApp:
 
     # -- event handlers --
 
-    def _on_bin_selected(self, path: str):
-        self._bin_path = path
-        sz = os.path.getsize(path)
-        self._bin_status.configure(
-            text=f"Selected: {Path(path).name}  ({sz/1_048_576:.2f} MB)",
-            text_color=C_SUCCESS,
-        )
+    def _on_save_selected(self, path: str | None, kind: str | None):
+        self._save_path = path
+        self._save_kind = kind
+        if path is None:
+            self._bin_status.configure(
+                text="Not a recognised save - pick a .bin file or a PS3 save folder.",
+                text_color=C_WARN_FG,
+            )
+        else:
+            sz = _path_size(path)
+            tag = "Xbox 360" if kind == KIND_XBOX else "PS3"
+            self._bin_status.configure(
+                text=f"Selected [{tag}]: {Path(path).name}  ({sz/1_048_576:.2f} MB)",
+                text_color=C_SUCCESS,
+            )
         self._check_ready()
 
     def _browse_game_dir(self):
@@ -282,14 +371,14 @@ class SaveManagerApp:
         typed = self._dir_entry.get().strip()
         if typed:
             self._game_dir = typed
-        ready = bool(self._bin_path) and bool(self._game_dir) and not self._running
+        ready = bool(self._save_path) and bool(self._game_dir) and not self._running
         self._convert_btn.configure(state='normal' if ready else 'disabled')
 
     def _start_conversion(self):
         typed = self._dir_entry.get().strip()
         if typed:
             self._game_dir = typed
-        if not self._bin_path or not self._game_dir:
+        if not self._save_path or not self._game_dir:
             return
 
         self._running = True
@@ -300,8 +389,12 @@ class SaveManagerApp:
 
     def _worker(self):
         try:
-            out_dir = convert_bin_to_win64(
-                self._bin_path, self._game_dir, log=self._log_write)
+            if self._save_kind == KIND_PS3:
+                out_dir = convert_ps3_to_win64(
+                    self._save_path, self._game_dir, log=self._log_write)
+            else:
+                out_dir = convert_bin_to_win64(
+                    self._save_path, self._game_dir, log=self._log_write)
             self.root.after(0, self._on_success, out_dir)
         except Exception as exc:
             self.root.after(0, self._on_error, str(exc))
@@ -347,8 +440,8 @@ class SaveManagerApp:
     # -- run --
 
     def run(self):
-        if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-            self.root.after(200, lambda: self._drop._set_file(sys.argv[1]))
+        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+            self.root.after(200, lambda: self._drop._set_path(sys.argv[1]))
         self.root.mainloop()
 
 
