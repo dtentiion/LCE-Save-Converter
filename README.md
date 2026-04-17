@@ -12,7 +12,7 @@ All world data is preserved - terrain, chests, items, signs, maps, player invent
 Anything newer than that bumps the save past the version this converter and the target Win64 dev build can read, so 1.13+ PS3 saves and TU20+ Xbox saves won't work.
 
 | Xbox 360 | PS3 |
-| --- | --- |
+| :---: | :---: |
 | ![Xbox screenshot](media/screenshot.png) | ![PS3 screenshot](media/screenshot_ps3.png) |
 
 [Watch the demo video](media/demo.mp4)
