@@ -1,8 +1,19 @@
 # LCE Save Converter - Xbox 360 / PS3 to Windows 64
 
+[![Downloads](https://img.shields.io/github/downloads/dtentiion/LCE-Save-Converter/total?style=flat-square&label=Downloads&color=0078d4)](https://github.com/dtentiion/LCE-Save-Converter/releases)
+[![Views](https://hits.sh/github.com/dtentiion/LCE-Save-Converter.svg?style=flat-square&label=Views&color=4caf7d)](https://github.com/dtentiion/LCE-Save-Converter)
+[![Stars](https://img.shields.io/github/stars/dtentiion/LCE-Save-Converter?style=flat-square&label=Stars&color=f0c060)](https://github.com/dtentiion/LCE-Save-Converter/stargazers)
+[![License](https://img.shields.io/github/license/dtentiion/LCE-Save-Converter?style=flat-square&color=9d9d9d)](LICENSE)
+
 Converts Minecraft Legacy Console Edition save files to the Windows 64 LCE format. Takes Xbox 360 `.bin` STFS CON containers and PS3 save folders (`GAMEDATA`) and turns them into a `saveData.ms` the PC client can load.
 
 All world data is preserved - terrain, chests, items, signs, maps, player inventories, Nether/End dimensions.
+
+<p align="center">
+  <a href="https://github.com/dtentiion/LCE-Save-Converter/releases/latest">
+    <img src="https://img.shields.io/badge/%E2%86%93%20Download%20Latest%20Release-0078d4?style=for-the-badge&logoColor=white" alt="Download latest release" height="44">
+  </a>
+</p>
 
 ## Supported save versions
 
