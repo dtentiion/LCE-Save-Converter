@@ -285,6 +285,72 @@ def _patch_player_pos(player_dat: bytes, x: float, y: float, z: float) -> bytes:
     return bytes(out)
 
 
+# RLE encoding format used inside region chunks.
+#   0..254     -> literal byte
+#   255, 0|1|2 -> 1..3 copies of 0xFF
+#   255, n>=3  -> (n+1) copies of next byte b (so 255, n, b)
+# Symmetric with DecompressRLE in MinecraftConsoles/Minecraft.World/compression.cpp.
+def _compress_rle(data: bytes) -> bytes:
+    out = bytearray()
+    n   = len(data)
+    i   = 0
+    while i < n:
+        b   = data[i]
+        run = 1
+        while i + run < n and data[i + run] == b and run < 256:
+            run += 1
+        if b == 0xFF:
+            if run <= 3:
+                out.append(0xFF)
+                out.append(run - 1)         # 0/1/2 = 1/2/3 FFs
+            else:
+                out.append(0xFF)
+                out.append(run - 1)         # 3..255 = 4..256 copies
+                out.append(0xFF)
+        else:
+            if run < 4:
+                out.extend([b] * run)
+            else:
+                out.append(0xFF)
+                out.append(run - 1)
+                out.append(b)
+        i += run
+    return bytes(out)
+
+
+def _build_empty_chunk_nbt(chunk_x: int, chunk_z: int) -> bytes:
+    """
+    Construct a minimal valid LCE region chunk NBT - all-air blocks,
+    full sky light, terrain populated, no entities. Used as a placeholder
+    when a chunk's source bytes are corrupt and no LZX library can
+    decode them; injecting this lets the world load instead of crashing
+    on the missing slot.
+    """
+    out = bytearray()
+    out += b'\x0a\x00\x00'                      # outer compound, no name
+    out += b'\x0a\x00\x05Level'                 # Level compound
+    # Blocks: 16 * 16 * 128 = 32768 bytes of air (id 0)
+    out += b'\x07\x00\x06Blocks' + struct.pack('>i', 32768) + b'\x00' * 32768
+    # Data: 4-bit packed = 16384 bytes
+    out += b'\x07\x00\x04Data'   + struct.pack('>i', 16384) + b'\x00' * 16384
+    # SkyLight: full sun
+    out += b'\x07\x00\x08SkyLight'   + struct.pack('>i', 16384) + b'\xff' * 16384
+    # BlockLight: dark
+    out += b'\x07\x00\x0aBlockLight' + struct.pack('>i', 16384) + b'\x00' * 16384
+    # HeightMap: 16x16 = 256
+    out += b'\x07\x00\x09HeightMap'  + struct.pack('>i', 256)   + b'\x00' * 256
+    # xPos / zPos chunk coords
+    out += b'\x03\x00\x04xPos' + struct.pack('>i', chunk_x)
+    out += b'\x03\x00\x04zPos' + struct.pack('>i', chunk_z)
+    out += b'\x04\x00\x0aLastUpdate' + struct.pack('>q', 0)
+    out += b'\x01\x00\x10TerrainPopulated\x01'
+    out += b'\x09\x00\x08Entities\x0a\x00\x00\x00\x00'      # empty list of compounds
+    out += b'\x09\x00\x0cTileEntities\x0a\x00\x00\x00\x00'  # empty list of compounds
+    out += b'\x00'                              # end Level
+    out += b'\x00'                              # end outer
+    return bytes(out)
+
+
 def _find_safe_spawn(dropped_chunks: set[tuple[int, int]],
                      orig: tuple[int, int, int],
                      safe_chunks: int = 12) -> tuple[int, int, int] | None:
@@ -740,7 +806,8 @@ def _lzx_decompress_native(lzx_stream: bytes, uncomp_total: int) -> bytes:
 # Region file conversion
 # =============================================================================
 
-def _convert_region(data: bytes, log=None, dropped_slots: list | None = None) -> bytes:
+def _convert_region(data: bytes, log=None, dropped_slots: list | None = None,
+                    region_coords: tuple[int, int] | None = None) -> bytes:
     """
     Convert a big-endian Xbox 360 region file to little-endian Win64 format.
     Decompresses each chunk's LZX data and recompresses with zlib.
@@ -748,6 +815,14 @@ def _convert_region(data: bytes, log=None, dropped_slots: list | None = None) ->
     If *dropped_slots* is given, every chunk that all decoder tiers reject
     has its slot index appended. Caller can use this to know which chunks
     to compensate for downstream (e.g. moving spawn away).
+
+    If *region_coords* is given (rx, rz), failed chunks get a synthetic
+    empty NBT chunk written at their slot instead of being zeroed. The
+    LCE engine pre-generates every chunk in the world border at world
+    creation time and crashes on world entry if any expected slot is
+    empty - the synthetic chunk has the right shape (all-air, terrain
+    populated) and lets the world load. The chunk's original blocks are
+    not recovered.
     """
     SECT = 4096
 
@@ -807,9 +882,30 @@ def _convert_region(data: bytes, log=None, dropped_slots: list | None = None) ->
                 log(f"chunk slot {slot} dropped (LZX decode failed: {exc})")
 
         if rle_data is None:
-            struct.pack_into('<I', new_buf, slot * 4, 0)
             if dropped_slots is not None:
                 dropped_slots.append(slot)
+            if region_coords is not None:
+                # Inject a synthetic empty chunk so the slot isn't blank.
+                rx, rz = region_coords
+                cx = rx * 32 + (slot % 32)
+                cz = rz * 32 + (slot // 32)
+                synth_nbt   = _build_empty_chunk_nbt(cx, cz)
+                synth_rle   = _compress_rle(synth_nbt)
+                synth_zlib  = zlib.compress(synth_rle, 6)
+                new_comp_len = len(synth_zlib)
+                needed   = ((8 + new_comp_len + SECT - 1) // SECT)
+                dest_off = next_sector * SECT
+                while dest_off + 8 + new_comp_len > len(new_buf):
+                    new_buf.extend(b'\x00' * SECT)
+                struct.pack_into('<I', new_buf, dest_off,
+                                 new_comp_len | 0x80000000)        # RLE flag set
+                struct.pack_into('<I', new_buf, dest_off + 4, len(synth_nbt))
+                new_buf[dest_off + 8 : dest_off + 8 + new_comp_len] = synth_zlib
+                struct.pack_into('<I', new_buf, slot * 4,
+                                 (next_sector << 8) | needed)
+                next_sector += needed
+                continue
+            struct.pack_into('<I', new_buf, slot * 4, 0)
             continue
 
         zlib_data = zlib.compress(rle_data, 6)
@@ -904,13 +1000,17 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
         if fn.lower().endswith(MCR_EXT) and len(raw_file) > 0:
             out(f"  Region file : {fn}")
             slots: list[int] = []
+            dim_info = _parse_region_filename(fn)
+            # Pass region coords so dropped chunks get a synthetic empty
+            # placeholder written at the slot instead of being blank.
+            region_xy = (dim_info[1], dim_info[2]) if dim_info else None
             raw_file = _convert_region(
                 raw_file,
                 log=lambda m, n=fn: out(f"    [!] {n}: {m}"),
                 dropped_slots=slots,
+                region_coords=region_xy,
             )
             # Only the overworld matters for spawn-load safety.
-            dim_info = _parse_region_filename(fn)
             if dim_info and dim_info[0] == 'overworld':
                 _, rx, rz = dim_info
                 for slot in slots:
@@ -991,8 +1091,8 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
             if moved_players:
                 out(f"      Relocated {moved_players} player(s) whose Pos was inside a bad "
                     f"chunk's load radius to {safe}.")
-                out(f"      Original chunk bytes are preserved - players just won't wake up "
-                    "in a chunk that would crash the world.")
+                out(f"      Bad chunk slots got a synthetic empty placeholder written - "
+                    "world will load, the affected 16x16 area renders as void/air.")
 
     HEADER_SIZE = 12
     body = bytearray()
