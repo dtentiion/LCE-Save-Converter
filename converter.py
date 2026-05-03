@@ -222,11 +222,55 @@ def _get_chm_lzx():
     return dll
 
 
+def _try_chm_lzx(lzx_raw: bytes, output_size: int, window: int) -> bytes | None:
+    """One CHMLib LZX attempt. Returns the decoded bytes or None on failure."""
+    dll   = _get_chm_lzx()
+    state = dll.chm_lzx_init(window)
+    if not state:
+        return None
+    try:
+        src_buf = (ctypes.c_ubyte * len(lzx_raw)).from_buffer_copy(lzx_raw)
+        dst_buf = (ctypes.c_ubyte * output_size)()
+        ret = dll.chm_lzx_decompress(state, src_buf, len(lzx_raw),
+                                      dst_buf, output_size)
+        if ret != 0:
+            return None
+        return bytes(dst_buf[:output_size])
+    finally:
+        dll.chm_lzx_teardown(state)
+
+
+def _try_ldi_chunk(xbox_data: bytes, output_size: int) -> bytes | None:
+    """
+    Try the GoobyCorp LDI library (closer to XMemDecompress) on a chunk.
+    The LDI iterator wants the full chunk including the 2- or 5-byte
+    framing header, with no leading uncomp_total prefix.
+    """
+    try:
+        out = _ldi_decompress_chunks(
+            xbox_data, output_size, has_header=False, block_max=LZX_BLOCK_SIZE,
+        )
+    except Exception:
+        return None
+    if not out:
+        return None
+    return out[:output_size]
+
+
 def _decompress_region_chunk(xbox_data: bytes) -> bytes:
     """
-    Decompress a single Xbox 360 region chunk (mini XMemCompress stream)
-    using the CHMLib LZX decoder.
+    Decompress a single Xbox 360 region chunk (mini XMemCompress stream).
     Returns the RLE-encoded intermediate data.
+
+    Tiered fallback for older saves whose chunks don't decode with the
+    default CHMLib LZX path:
+      1. CHMLib at window=17 (handles ~99% of TU14+ chunks)
+      2. CHMLib at windows 15..21 (catches non-default windows)
+      3. GoobyCorp LDI (a different LZX implementation closer to
+         Microsoft's XMemDecompress; sometimes accepts chunks CHMLib
+         rejects)
+    Raises RuntimeError if every path fails - the caller will drop the
+    chunk and log it.
     """
     hi = xbox_data[0]
     if hi == 0xFF:
@@ -238,21 +282,25 @@ def _decompress_region_chunk(xbox_data: bytes) -> bytes:
         output_size = LZX_BLOCK_SIZE
         lzx_raw     = xbox_data[2 : 2 + src_sz]
 
-    dll   = _get_chm_lzx()
-    state = dll.chm_lzx_init(17)      # window = 2^17 = 131072
-    if not state:
-        raise RuntimeError("chm_lzx_init failed")
+    # Tier 1: default window. The vast majority of saves stop here.
+    out = _try_chm_lzx(lzx_raw, output_size, 17)
+    if out is not None:
+        return out
 
-    try:
-        src_buf = (ctypes.c_ubyte * len(lzx_raw)).from_buffer_copy(lzx_raw)
-        dst_buf = (ctypes.c_ubyte * output_size)()
-        ret = dll.chm_lzx_decompress(state, src_buf, len(lzx_raw),
-                                      dst_buf, output_size)
-        if ret != 0:
-            raise RuntimeError(f"chm_lzx_decompress failed (ret={ret})")
-        return bytes(dst_buf[:output_size])
-    finally:
-        dll.chm_lzx_teardown(state)
+    # Tier 2: sweep alternative window sizes. Older saves sometimes use
+    # a different window than the modern default.
+    for w in (16, 15, 18, 19, 20, 21):
+        out = _try_chm_lzx(lzx_raw, output_size, w)
+        if out is not None:
+            return out
+
+    # Tier 3: try the LDI library. It's the wrapper closest to the
+    # XMemDecompress API the real Xbox 360 firmware uses.
+    out = _try_ldi_chunk(xbox_data, output_size)
+    if out is not None:
+        return out
+
+    raise RuntimeError("LZX decode failed (CHMLib + window sweep + LDI all rejected the chunk)")
 
 
 # -- GoobyCorp LDI (for save-level decompression) --
