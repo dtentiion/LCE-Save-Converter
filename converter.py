@@ -223,25 +223,38 @@ def _get_chm_lzx():
 
 
 # -- Microsoft XCompress (XMemDecompress) - the real API used by the Xbox 360
-#    firmware and the LCE PC build. Optional: only loaded if xcompress.dll is
-#    present beside the other DLLs. When it is, it gets a turn in the chunk
-#    fallback chain and recovers chunks the open-source decoders miss. --
+#    firmware and the LCE PC build. Optional fallback tier: only active if
+#    xcompress64.dll is present beside the other DLLs. When it is, it gets a
+#    turn in the chunk fallback chain and recovers chunks the open-source
+#    decoders miss. Note that Microsoft's LZX is strict about malformed input
+#    and can hit access violations on truly corrupt chunks; we wrap the call
+#    in OSError handling so a bad chunk just falls through cleanly. --
 
 _XCOMPRESS_DLL = None
 _XCOMPRESS_TRIED = False
-_XCOMPRESS_PATH = Path(__file__).parent / 'xcompress.dll'
+_XCOMPRESS_PATH = Path(__file__).parent / 'xcompress64.dll'
+
+_XMEM_PAD_BYTES = 0x10000   # zero-padding appended to every input so XMem's
+                            # lookahead reads don't run off the end of buffer
 
 
 class _XMEMCODEC_PARAMETERS_LZX(ctypes.Structure):
+    _pack_ = 4
     _fields_ = [
         ("Flags",                    ctypes.c_uint32),
         ("WindowSize",               ctypes.c_uint32),
         ("CompressionPartitionSize", ctypes.c_uint32),
+        # The Win64 build of xcompress takes an extended 6-field params
+        # struct - extra three uint32s are 0-initialized and unused for
+        # decompression but the DLL reads them anyway.
+        ("_unk0",                    ctypes.c_uint32),
+        ("_unk1",                    ctypes.c_uint32),
+        ("_unk2",                    ctypes.c_uint32),
     ]
 
 
 def _get_xcompress_dll():
-    """Lazy-load xcompress.dll. Returns None if it isn't shipped beside us."""
+    """Lazy-load xcompress64.dll. Returns None if it isn't shipped beside us."""
     global _XCOMPRESS_DLL, _XCOMPRESS_TRIED
     if _XCOMPRESS_TRIED:
         return _XCOMPRESS_DLL
@@ -253,25 +266,24 @@ def _get_xcompress_dll():
     except OSError:
         return None
     HRESULT = ctypes.c_int32
-    SIZE_T  = ctypes.c_size_t
     HANDLE  = ctypes.c_void_p
 
     dll.XMemCreateDecompressionContext.argtypes = [
-        ctypes.c_int,                               # XMEMCODEC_TYPE
-        ctypes.c_void_p,                            # pCodecParams
-        ctypes.c_uint32,                            # Flags
-        ctypes.POINTER(HANDLE),                     # pContext
+        ctypes.c_uint32,                            # XMEMCODEC_TYPE
+        ctypes.POINTER(_XMEMCODEC_PARAMETERS_LZX),
+        ctypes.c_int32,                             # Flags
+        ctypes.POINTER(HANDLE),
     ]
     dll.XMemCreateDecompressionContext.restype  = HRESULT
 
     dll.XMemDecompress.argtypes = [
         HANDLE,
-        ctypes.c_void_p,                            # pDestination
-        ctypes.POINTER(SIZE_T),                     # pDestSize
-        ctypes.c_void_p,                            # pSource
-        SIZE_T,                                     # SrcSize
+        ctypes.c_char_p,                            # pDestination
+        ctypes.POINTER(ctypes.c_uint64),            # pDestSize
+        ctypes.c_char_p,                            # pSource
+        ctypes.c_uint64,                            # SrcSize
     ]
-    dll.XMemDecompress.restype  = HRESULT
+    dll.XMemDecompress.restype  = ctypes.c_uint32
 
     dll.XMemDestroyDecompressionContext.argtypes = [HANDLE]
     dll.XMemDestroyDecompressionContext.restype  = None
@@ -286,19 +298,18 @@ def _try_xcompress_chunk(xbox_data: bytes, output_size: int) -> bytes | None:
     bytes go in (including the 2- or 5-byte header) - XMem parses the
     framing itself. Returns the decoded bytes or None on failure.
 
-    XMEMCODEC_TYPE_LZX = 1. Window/partition sizes match what 4J Studios
-    use in the leaked source (128 KiB).
+    Pads the input with zeros so XMem's speculative lookahead reads
+    don't run past the end of the heap-allocated buffer (which would
+    AV). For chunks with truly malformed LZX data, the decoder may
+    still throw an access violation - we catch it as OSError and let
+    the caller move on.
     """
     dll = _get_xcompress_dll()
     if dll is None:
         return None
 
     XMEMCODEC_LZX = 1
-    params = _XMEMCODEC_PARAMETERS_LZX(
-        Flags=0,
-        WindowSize=128 * 1024,
-        CompressionPartitionSize=128 * 1024,
-    )
+    params = _XMEMCODEC_PARAMETERS_LZX(0, 128 * 1024, 128 * 1024, 0, 0, 0)
     ctx = ctypes.c_void_p()
     hr = dll.XMemCreateDecompressionContext(
         XMEMCODEC_LZX, ctypes.byref(params), 0, ctypes.byref(ctx),
@@ -307,22 +318,21 @@ def _try_xcompress_chunk(xbox_data: bytes, output_size: int) -> bytes | None:
         return None
 
     try:
-        # Give XMem a slightly larger output buffer than the inner header
-        # claims - some chunks decompress to more than the header advertises.
-        cap = max(output_size, LZX_BLOCK_SIZE)
-        src_buf = (ctypes.c_ubyte * len(xbox_data)).from_buffer_copy(xbox_data)
-        dst_buf = (ctypes.c_ubyte * cap)()
-        dst_sz  = ctypes.c_size_t(cap)
+        # Heap padding for speculative reads + a generous output buffer.
+        padded = xbox_data + b'\x00' * _XMEM_PAD_BYTES
+        cap = max(output_size * 2, LZX_BLOCK_SIZE * 4)
+        out_buf = ctypes.create_string_buffer(cap)
+        out_sz  = ctypes.c_uint64(cap)
         try:
             hr = dll.XMemDecompress(
-                ctx, dst_buf, ctypes.byref(dst_sz),
-                src_buf, ctypes.c_size_t(len(xbox_data)),
+                ctx, out_buf, ctypes.byref(out_sz),
+                padded, ctypes.c_uint64(len(padded)),
             )
         except OSError:
             return None
-        if hr != 0:
+        if hr != 0 or out_sz.value == 0:
             return None
-        return bytes(dst_buf[: dst_sz.value])
+        return bytes(out_buf[: out_sz.value])
     finally:
         try:
             dll.XMemDestroyDecompressionContext(ctx)
