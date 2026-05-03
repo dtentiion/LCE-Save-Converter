@@ -989,7 +989,26 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
 
     out("Converting  Xbox 360 (BE) -> Windows 64 (LE) ...")
 
-    entries = _parse_ftable_be(decompressed, ho, ne)
+    raw_entries = _parse_ftable_be(decompressed, ho, ne)
+
+    # cv=5 saves carry an older `data/mapDataMappings.dat` whose binary
+    # layout differs from cv>=6 (different PlayerUID size). The Win64
+    # client parses this file based on cv but the file format actually
+    # changed at cv=6, so a cv=5 file fed to the cv-aware reader either
+    # misreads the count and tries to allocate / iterate gigabytes ->
+    # crash on world load. Easiest fix: drop the file. The world reads
+    # zero mappings, individual maps may show blank until re-used, but
+    # the world loads.
+    drop_filenames = set()
+    if cv < 6:
+        drop_filenames.add('data/mapdatamappings.dat')
+
+    entries = []
+    for e in raw_entries:
+        if e['filename'].lower() in drop_filenames:
+            out(f"  Skipping    : {e['filename']}  (cv={cv} format incompatible with TU19 reader)")
+            continue
+        entries.append(e)
 
     file_blobs: list[bytes] = []
     dropped_overworld: set[tuple[int, int]] = set()
@@ -1130,7 +1149,7 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
     if cv > 9:
         out(f"  [!] Source cv={cv} clamped to 9; TU{cv} data may not load correctly.")
     header = struct.pack('<I', new_fto)
-    header += struct.pack('<I', ne)
+    header += struct.pack('<I', len(entries))   # may be < source ne if we dropped any files
     header += struct.pack('<h', ov)
     header += struct.pack('<h', out_cv)
 
