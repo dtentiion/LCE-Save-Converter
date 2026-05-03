@@ -432,8 +432,9 @@ def _convert_region(data: bytes, log=None) -> bytes:
         rle_data = None
         try:
             rle_data = _decompress_region_chunk(xbox_data)
-        except Exception:
-            pass
+        except Exception as exc:
+            if log:
+                log(f"chunk slot {slot} dropped (LZX decode failed: {exc})")
 
         if rle_data is None:
             struct.pack_into('<I', new_buf, slot * 4, 0)
@@ -529,7 +530,7 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
         raw_file = decompressed[s : s + l] if s + l <= len(decompressed) else b''
         if fn.lower().endswith(MCR_EXT) and len(raw_file) > 0:
             out(f"  Region file : {fn}")
-            raw_file = _convert_region(raw_file)
+            raw_file = _convert_region(raw_file, log=lambda m, n=fn: out(f"    [!] {n}: {m}"))
         else:
             out(f"  Keeping     : {fn}")
         file_blobs.append(raw_file)
@@ -561,11 +562,18 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
         ftable.extend(struct.pack('<I', ne_entry['start']))
         ftable.extend(struct.pack('<q', ne_entry['last_mod']))
 
-    WIN64_SAVE_VERSION = 9
+    # Preserve the source cv so the game's TU migration code knows what
+    # data shape it's looking at. Forcing it to 9 (TU19) on an older
+    # save (cv<9) made the client load TU<19-format data as if it were
+    # TU19, which crashes at world-load time. Anything above 9 is
+    # clamped because the TU19 dev build can't read TU20+ payloads.
+    out_cv = cv if cv <= 9 else 9
+    if cv > 9:
+        out(f"  [!] Source cv={cv} clamped to 9; TU{cv} data may not load correctly.")
     header = struct.pack('<I', new_fto)
     header += struct.pack('<I', ne)
     header += struct.pack('<h', ov)
-    header += struct.pack('<h', WIN64_SAVE_VERSION)
+    header += struct.pack('<h', out_cv)
 
     raw_le = bytes(header) + bytes(body) + bytes(ftable)
     out(f"  Converted   : {len(raw_le):,} bytes (uncompressed)")
