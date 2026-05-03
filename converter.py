@@ -222,6 +222,114 @@ def _get_chm_lzx():
     return dll
 
 
+# -- Microsoft XCompress (XMemDecompress) - the real API used by the Xbox 360
+#    firmware and the LCE PC build. Optional: only loaded if xcompress.dll is
+#    present beside the other DLLs. When it is, it gets a turn in the chunk
+#    fallback chain and recovers chunks the open-source decoders miss. --
+
+_XCOMPRESS_DLL = None
+_XCOMPRESS_TRIED = False
+_XCOMPRESS_PATH = Path(__file__).parent / 'xcompress.dll'
+
+
+class _XMEMCODEC_PARAMETERS_LZX(ctypes.Structure):
+    _fields_ = [
+        ("Flags",                    ctypes.c_uint32),
+        ("WindowSize",               ctypes.c_uint32),
+        ("CompressionPartitionSize", ctypes.c_uint32),
+    ]
+
+
+def _get_xcompress_dll():
+    """Lazy-load xcompress.dll. Returns None if it isn't shipped beside us."""
+    global _XCOMPRESS_DLL, _XCOMPRESS_TRIED
+    if _XCOMPRESS_TRIED:
+        return _XCOMPRESS_DLL
+    _XCOMPRESS_TRIED = True
+    if not _XCOMPRESS_PATH.exists():
+        return None
+    try:
+        dll = ctypes.WinDLL(str(_XCOMPRESS_PATH))
+    except OSError:
+        return None
+    HRESULT = ctypes.c_int32
+    SIZE_T  = ctypes.c_size_t
+    HANDLE  = ctypes.c_void_p
+
+    dll.XMemCreateDecompressionContext.argtypes = [
+        ctypes.c_int,                               # XMEMCODEC_TYPE
+        ctypes.c_void_p,                            # pCodecParams
+        ctypes.c_uint32,                            # Flags
+        ctypes.POINTER(HANDLE),                     # pContext
+    ]
+    dll.XMemCreateDecompressionContext.restype  = HRESULT
+
+    dll.XMemDecompress.argtypes = [
+        HANDLE,
+        ctypes.c_void_p,                            # pDestination
+        ctypes.POINTER(SIZE_T),                     # pDestSize
+        ctypes.c_void_p,                            # pSource
+        SIZE_T,                                     # SrcSize
+    ]
+    dll.XMemDecompress.restype  = HRESULT
+
+    dll.XMemDestroyDecompressionContext.argtypes = [HANDLE]
+    dll.XMemDestroyDecompressionContext.restype  = None
+
+    _XCOMPRESS_DLL = dll
+    return dll
+
+
+def _try_xcompress_chunk(xbox_data: bytes, output_size: int) -> bytes | None:
+    """
+    Try Microsoft's XMemDecompress on a region chunk. The full chunk
+    bytes go in (including the 2- or 5-byte header) - XMem parses the
+    framing itself. Returns the decoded bytes or None on failure.
+
+    XMEMCODEC_TYPE_LZX = 1. Window/partition sizes match what 4J Studios
+    use in the leaked source (128 KiB).
+    """
+    dll = _get_xcompress_dll()
+    if dll is None:
+        return None
+
+    XMEMCODEC_LZX = 1
+    params = _XMEMCODEC_PARAMETERS_LZX(
+        Flags=0,
+        WindowSize=128 * 1024,
+        CompressionPartitionSize=128 * 1024,
+    )
+    ctx = ctypes.c_void_p()
+    hr = dll.XMemCreateDecompressionContext(
+        XMEMCODEC_LZX, ctypes.byref(params), 0, ctypes.byref(ctx),
+    )
+    if hr != 0 or not ctx.value:
+        return None
+
+    try:
+        # Give XMem a slightly larger output buffer than the inner header
+        # claims - some chunks decompress to more than the header advertises.
+        cap = max(output_size, LZX_BLOCK_SIZE)
+        src_buf = (ctypes.c_ubyte * len(xbox_data)).from_buffer_copy(xbox_data)
+        dst_buf = (ctypes.c_ubyte * cap)()
+        dst_sz  = ctypes.c_size_t(cap)
+        try:
+            hr = dll.XMemDecompress(
+                ctx, dst_buf, ctypes.byref(dst_sz),
+                src_buf, ctypes.c_size_t(len(xbox_data)),
+            )
+        except OSError:
+            return None
+        if hr != 0:
+            return None
+        return bytes(dst_buf[: dst_sz.value])
+    finally:
+        try:
+            dll.XMemDestroyDecompressionContext(ctx)
+        except OSError:
+            pass
+
+
 def _try_chm_lzx(lzx_raw: bytes, output_size: int, window: int) -> bytes | None:
     """One CHMLib LZX attempt. Returns the decoded bytes or None on failure."""
     dll   = _get_chm_lzx()
@@ -262,15 +370,16 @@ def _decompress_region_chunk(xbox_data: bytes) -> bytes:
     Decompress a single Xbox 360 region chunk (mini XMemCompress stream).
     Returns the RLE-encoded intermediate data.
 
-    Tiered fallback for older saves whose chunks don't decode with the
-    default CHMLib LZX path:
-      1. CHMLib at window=17 (handles ~99% of TU14+ chunks)
+    Tiered fallback for chunks whose default decode path fails:
+      1. CHMLib at window=17 (handles ~99% of TU14+ chunks, fast path)
       2. CHMLib at windows 15..21 (catches non-default windows)
-      3. GoobyCorp LDI (a different LZX implementation closer to
-         Microsoft's XMemDecompress; sometimes accepts chunks CHMLib
-         rejects)
-    Raises RuntimeError if every path fails - the caller will drop the
-    chunk and log it.
+      3. GoobyCorp LDI (a different LZX implementation, close to XMem)
+      4. Microsoft xcompress.dll (real XMemDecompress, optional - only
+         attempted if xcompress.dll ships beside us; this is the same
+         API the Xbox 360 firmware itself uses, so it accepts every
+         chunk Xenia accepts)
+    Raises RuntimeError if every available path fails - the caller will
+    drop the chunk and log it.
     """
     hi = xbox_data[0]
     if hi == 0xFF:
@@ -300,7 +409,14 @@ def _decompress_region_chunk(xbox_data: bytes) -> bytes:
     if out is not None:
         return out
 
-    raise RuntimeError("LZX decode failed (CHMLib + window sweep + LDI all rejected the chunk)")
+    # Tier 4: hand off to xcompress.dll if it's present. This is the
+    # actual Microsoft API; it picks up chunks the open-source decoders
+    # can't follow.
+    out = _try_xcompress_chunk(xbox_data, output_size)
+    if out is not None:
+        return out
+
+    raise RuntimeError("LZX decode failed (every available decoder rejected the chunk)")
 
 
 # -- GoobyCorp LDI (for save-level decompression) --
