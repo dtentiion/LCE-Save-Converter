@@ -260,6 +260,31 @@ def _patch_spawn(level_dat: bytes, x: int, y: int, z: int) -> bytes:
     return bytes(out)
 
 
+# Player NBT signature: TAG_List "Pos" of 3 doubles.
+#   0x09 (TAG_List) | 0x0003 (name length BE) | "Pos" | 0x06 (element type=double)
+#   | 0x00000003 (list length BE)
+_PLAYER_POS_SIG = b'\x09\x00\x03Pos\x06\x00\x00\x00\x03'
+
+
+def _read_player_pos(player_dat: bytes) -> tuple[float, float, float] | None:
+    idx = player_dat.find(_PLAYER_POS_SIG)
+    if idx < 0:
+        return None
+    p = idx + len(_PLAYER_POS_SIG)
+    if p + 24 > len(player_dat):
+        return None
+    return struct.unpack_from('>ddd', player_dat, p)
+
+
+def _patch_player_pos(player_dat: bytes, x: float, y: float, z: float) -> bytes:
+    """Overwrite the Pos TAG_List in a player.dat. Length unchanged (3 BE doubles)."""
+    out = bytearray(player_dat)
+    idx = out.find(_PLAYER_POS_SIG)
+    if idx >= 0:
+        struct.pack_into('>ddd', out, idx + len(_PLAYER_POS_SIG), x, y, z)
+    return bytes(out)
+
+
 def _find_safe_spawn(dropped_chunks: set[tuple[int, int]],
                      orig: tuple[int, int, int],
                      safe_chunks: int = 12) -> tuple[int, int, int] | None:
@@ -896,10 +921,24 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
             out(f"  Keeping     : {fn}")
         file_blobs.append(raw_file)
 
-    # Spawn-rescue: only kicks in when overworld chunks were dropped AND
-    # the original spawn would land near one of them. Saves with no drops
-    # come out byte-identical to the previous behaviour.
+    # Spawn-rescue: only kicks in when overworld chunks were dropped.
+    # Saves with no drops come out byte-identical to the previous behaviour.
+    #
+    # Two things need patching when a chunk drop sits near where the
+    # game wants to load on world entry:
+    #   1. level.dat's SpawnX/Y/Z, which is where the world list places
+    #      the player on first load
+    #   2. every player.dat's Pos tag, which is where each existing
+    #      player wakes up when their profile is selected. Hunger Games
+    #      maps in particular have dozens of player files clustered in
+    #      a small build area; one of them landing in the bad chunk's
+    #      load radius is enough to crash on world entry even if the
+    #      world spawn itself is fine.
     if dropped_overworld:
+        # Decide where "safe" is. Use the world spawn if the bad chunks
+        # are far from it; otherwise pick a spiral-out spot.
+        new_spawn: tuple[int, int, int] | None = None
+        spawn: tuple[int, int, int] | None = None
         for i, e in enumerate(entries):
             if e['filename'].lower() != 'level.dat':
                 continue
@@ -907,17 +946,53 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
             if spawn is None:
                 break
             new_spawn = _find_safe_spawn(dropped_overworld, spawn)
-            if new_spawn is None:
-                # Spawn is already safely far from every dropped chunk.
-                out(f"  [i] {len(dropped_overworld)} chunk(s) dropped but spawn is clear; "
-                    "no level.dat patch needed.")
-            else:
+            if new_spawn is not None:
                 file_blobs[i] = _patch_spawn(file_blobs[i], *new_spawn)
+            break
+
+        # The point we tell stranded players to wake up at. Prefer the
+        # patched spawn; if no patch was needed, we still relocate
+        # players who happen to be inside a bad chunk's load radius.
+        safe = new_spawn if new_spawn is not None else spawn
+        if safe is None:
+            out(f"  [!] {len(dropped_overworld)} chunk(s) dropped but no level.dat "
+                "spawn to anchor against - skipping rescue.")
+        else:
+            sx_blk, sy_blk, sz_blk = safe
+            sx_chunk, sz_chunk = sx_blk >> 4, sz_blk >> 4
+
+            def _too_close(cx: int, cz: int) -> bool:
+                for dx, dz in dropped_overworld:
+                    if max(abs(cx - dx), abs(cz - dz)) < 12:
+                        return True
+                return False
+
+            moved_players = 0
+            for i, e in enumerate(entries):
+                if not e['filename'].startswith('players/') or not e['filename'].endswith('.dat'):
+                    continue
+                blob = file_blobs[i]
+                pos = _read_player_pos(blob)
+                if pos is None:
+                    continue
+                px, py, pz = pos
+                cx, cz = int(px // 16), int(pz // 16)
+                if _too_close(cx, cz):
+                    file_blobs[i] = _patch_player_pos(
+                        blob, float(sx_blk) + 0.5, float(sy_blk), float(sz_blk) + 0.5,
+                    )
+                    moved_players += 1
+
+            if new_spawn is not None and spawn is not None:
                 out(f"  [!] {len(dropped_overworld)} unrecoverable chunk(s) near spawn.")
                 out(f"      Spawn moved {spawn} -> {new_spawn} so the world loads on Win64.")
-                out(f"      The corrupt chunk's bytes are preserved in the region file - "
-                    "the player just won't approach them automatically.")
-            break
+            elif new_spawn is None:
+                out(f"  [i] {len(dropped_overworld)} chunk(s) dropped; spawn was already safe.")
+            if moved_players:
+                out(f"      Relocated {moved_players} player(s) whose Pos was inside a bad "
+                    f"chunk's load radius to {safe}.")
+                out(f"      Original chunk bytes are preserved - players just won't wake up "
+                    "in a chunk that would crash the world.")
 
     HEADER_SIZE = 12
     body = bytearray()
