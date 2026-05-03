@@ -193,6 +193,109 @@ def _sanitise(name: str) -> str:
 
 
 # =============================================================================
+# Region filename + level.dat spawn helpers
+# =============================================================================
+#
+# Some saves contain individual region chunks whose LZX data is corrupt
+# at the bit level - no LZX decoder can read them. The converter drops
+# these chunks (their slot in the location table is zeroed). On Win64
+# the client crashes if a missing chunk falls inside the player's load
+# radius around spawn. To make the world loadable, we shift spawn to a
+# chunk far enough from any drop that the load radius doesn't touch
+# them. The corrupt bytes stay in the region file untouched - if the
+# player ever walks back to that area they'll hit the same crash, but
+# under normal play the world loads and the rest of the terrain, items,
+# chests, etc. are preserved. This logic only fires when chunks are
+# actually dropped; saves with no drops convert exactly as before.
+
+_REGION_FNAME_RE = {
+    'end':       re.compile(r'^dim1[/\\]r\.(-?\d+)\.(-?\d+)\.mcr$'),
+    'nether':    re.compile(r'^dim-1r\.(-?\d+)\.(-?\d+)\.mcr$'),
+    'overworld': re.compile(r'^r\.(-?\d+)\.(-?\d+)\.mcr$'),
+}
+
+
+def _parse_region_filename(name: str) -> tuple[str, int, int] | None:
+    """
+    Returns (dimension, region_x, region_z) where dimension is one of
+    'overworld' / 'nether' / 'end'. None if the name isn't a region file.
+    """
+    n = name.lower()
+    for dim, regex in _REGION_FNAME_RE.items():
+        m = regex.match(n)
+        if m:
+            return (dim, int(m.group(1)), int(m.group(2)))
+    return None
+
+
+# NBT TAG_Int signature for SpawnX / SpawnY / SpawnZ:
+#   0x03 (TAG_Int) | 0x0006 (name length BE) | "SpawnX|Y|Z" | 4 bytes BE int
+def _spawn_sig(axis: str) -> bytes:
+    return b'\x03\x00\x06Spawn' + axis.encode('ascii')
+
+
+def _read_spawn(level_dat: bytes) -> tuple[int, int, int] | None:
+    """Parse SpawnX/Y/Z from a level.dat NBT blob. None if any tag missing."""
+    coords = []
+    for axis in ('X', 'Y', 'Z'):
+        sig = _spawn_sig(axis)
+        idx = level_dat.find(sig)
+        if idx < 0:
+            return None
+        val_off = idx + len(sig)
+        if val_off + 4 > len(level_dat):
+            return None
+        coords.append(struct.unpack_from('>i', level_dat, val_off)[0])
+    return (coords[0], coords[1], coords[2])
+
+
+def _patch_spawn(level_dat: bytes, x: int, y: int, z: int) -> bytes:
+    """Overwrite SpawnX/Y/Z in level.dat. NBT length is unchanged (TAG_Int=4B)."""
+    out = bytearray(level_dat)
+    for axis, val in (('X', x), ('Y', y), ('Z', z)):
+        sig = _spawn_sig(axis)
+        idx = out.find(sig)
+        if idx >= 0:
+            struct.pack_into('>i', out, idx + len(sig), val)
+    return bytes(out)
+
+
+def _find_safe_spawn(dropped_chunks: set[tuple[int, int]],
+                     orig: tuple[int, int, int],
+                     safe_chunks: int = 12) -> tuple[int, int, int] | None:
+    """
+    Spiral outward from the original spawn looking for a chunk that's at
+    least *safe_chunks* (Chebyshev distance) away from any dropped chunk.
+    Returns the new (x, y, z) in block coords or None if the original
+    spawn is already safe / no spiral position found.
+    """
+    if not dropped_chunks:
+        return None
+    sx, sy, sz = orig
+    sc_x, sc_z = sx >> 4, sz >> 4
+
+    def too_close(cx: int, cz: int) -> bool:
+        for dx, dz in dropped_chunks:
+            if max(abs(cx - dx), abs(cz - dz)) < safe_chunks:
+                return True
+        return False
+
+    if not too_close(sc_x, sc_z):
+        return None
+
+    for radius in range(1, 200):
+        for dz in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if max(abs(dx), abs(dz)) != radius:
+                    continue
+                cx = sc_x + dx
+                cz = sc_z + dz
+                if not too_close(cx, cz):
+                    return (cx * 16 + 8, sy, cz * 16 + 8)
+    return None
+
+
+# =============================================================================
 # LZX decompression (native DLLs)
 # =============================================================================
 
@@ -612,10 +715,14 @@ def _lzx_decompress_native(lzx_stream: bytes, uncomp_total: int) -> bytes:
 # Region file conversion
 # =============================================================================
 
-def _convert_region(data: bytes, log=None) -> bytes:
+def _convert_region(data: bytes, log=None, dropped_slots: list | None = None) -> bytes:
     """
     Convert a big-endian Xbox 360 region file to little-endian Win64 format.
     Decompresses each chunk's LZX data and recompresses with zlib.
+
+    If *dropped_slots* is given, every chunk that all decoder tiers reject
+    has its slot index appended. Caller can use this to know which chunks
+    to compensate for downstream (e.g. moving spawn away).
     """
     SECT = 4096
 
@@ -676,6 +783,8 @@ def _convert_region(data: bytes, log=None) -> bytes:
 
         if rle_data is None:
             struct.pack_into('<I', new_buf, slot * 4, 0)
+            if dropped_slots is not None:
+                dropped_slots.append(slot)
             continue
 
         zlib_data = zlib.compress(rle_data, 6)
@@ -762,16 +871,53 @@ def convert_bin_to_win64(bin_path: str, game_dir: str,
     entries = _parse_ftable_be(decompressed, ho, ne)
 
     file_blobs: list[bytes] = []
+    dropped_overworld: set[tuple[int, int]] = set()
     for e in entries:
         fn = e['filename']
         s, l = e['start_offset'], e['length']
         raw_file = decompressed[s : s + l] if s + l <= len(decompressed) else b''
         if fn.lower().endswith(MCR_EXT) and len(raw_file) > 0:
             out(f"  Region file : {fn}")
-            raw_file = _convert_region(raw_file, log=lambda m, n=fn: out(f"    [!] {n}: {m}"))
+            slots: list[int] = []
+            raw_file = _convert_region(
+                raw_file,
+                log=lambda m, n=fn: out(f"    [!] {n}: {m}"),
+                dropped_slots=slots,
+            )
+            # Only the overworld matters for spawn-load safety.
+            dim_info = _parse_region_filename(fn)
+            if dim_info and dim_info[0] == 'overworld':
+                _, rx, rz = dim_info
+                for slot in slots:
+                    cx = rx * 32 + (slot % 32)
+                    cz = rz * 32 + (slot // 32)
+                    dropped_overworld.add((cx, cz))
         else:
             out(f"  Keeping     : {fn}")
         file_blobs.append(raw_file)
+
+    # Spawn-rescue: only kicks in when overworld chunks were dropped AND
+    # the original spawn would land near one of them. Saves with no drops
+    # come out byte-identical to the previous behaviour.
+    if dropped_overworld:
+        for i, e in enumerate(entries):
+            if e['filename'].lower() != 'level.dat':
+                continue
+            spawn = _read_spawn(file_blobs[i])
+            if spawn is None:
+                break
+            new_spawn = _find_safe_spawn(dropped_overworld, spawn)
+            if new_spawn is None:
+                # Spawn is already safely far from every dropped chunk.
+                out(f"  [i] {len(dropped_overworld)} chunk(s) dropped but spawn is clear; "
+                    "no level.dat patch needed.")
+            else:
+                file_blobs[i] = _patch_spawn(file_blobs[i], *new_spawn)
+                out(f"  [!] {len(dropped_overworld)} unrecoverable chunk(s) near spawn.")
+                out(f"      Spawn moved {spawn} -> {new_spawn} so the world loads on Win64.")
+                out(f"      The corrupt chunk's bytes are preserved in the region file - "
+                    "the player just won't approach them automatically.")
+            break
 
     HEADER_SIZE = 12
     body = bytearray()
