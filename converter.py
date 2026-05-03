@@ -358,6 +358,62 @@ def _try_chm_lzx(lzx_raw: bytes, output_size: int, window: int) -> bytes | None:
         dll.chm_lzx_teardown(state)
 
 
+# -- libmspack LZX decoder (lce_lzx.dll) - Stuart Caie's mspack ported with a
+#    small wrapper that exposes a single decompress entry point. mspack is
+#    what Xenia uses; it tolerates malformed input by returning error codes
+#    instead of access-violating, so it usually catches anything that strict
+#    decoders reject. --
+
+_MSPACK_DLL = None
+_MSPACK_TRIED = False
+_MSPACK_PATH = Path(__file__).parent / 'lce_lzx.dll'
+
+
+def _get_mspack_dll():
+    global _MSPACK_DLL, _MSPACK_TRIED
+    if _MSPACK_TRIED:
+        return _MSPACK_DLL
+    _MSPACK_TRIED = True
+    if not _MSPACK_PATH.exists():
+        return None
+    try:
+        dll = ctypes.WinDLL(str(_MSPACK_PATH))
+    except OSError:
+        return None
+    dll.lce_lzxd_decompress.argtypes = [
+        ctypes.c_char_p,                      # src
+        ctypes.c_size_t,                      # src_len
+        ctypes.c_char_p,                      # dst
+        ctypes.c_size_t,                      # dst_len
+        ctypes.c_int,                         # window_bits
+        ctypes.POINTER(ctypes.c_size_t),      # out_actual
+    ]
+    dll.lce_lzxd_decompress.restype = ctypes.c_int
+    _MSPACK_DLL = dll
+    return dll
+
+
+def _try_mspack_chunk(lzx_raw: bytes, output_size: int) -> bytes | None:
+    """
+    Try libmspack on a stripped LZX bitstream. Sweeps window_bits 15..21
+    on failure since older saves don't always declare a fixed window.
+    Returns the decoded bytes or None if every window rejects the chunk.
+    """
+    dll = _get_mspack_dll()
+    if dll is None:
+        return None
+    out_buf = ctypes.create_string_buffer(output_size + 16)
+    actual  = ctypes.c_size_t(0)
+    for wb in (17, 16, 15, 18, 19, 20, 21):
+        actual.value = 0
+        rc = dll.lce_lzxd_decompress(lzx_raw, len(lzx_raw),
+                                     out_buf, output_size, wb,
+                                     ctypes.byref(actual))
+        if rc == 0 and actual.value == output_size:
+            return bytes(out_buf[: actual.value])
+    return None
+
+
 def _try_ldi_chunk(xbox_data: bytes, output_size: int) -> bytes | None:
     """
     Try the GoobyCorp LDI library (closer to XMemDecompress) on a chunk.
@@ -384,10 +440,12 @@ def _decompress_region_chunk(xbox_data: bytes) -> bytes:
       1. CHMLib at window=17 (handles ~99% of TU14+ chunks, fast path)
       2. CHMLib at windows 15..21 (catches non-default windows)
       3. GoobyCorp LDI (a different LZX implementation, close to XMem)
-      4. Microsoft xcompress.dll (real XMemDecompress, optional - only
-         attempted if xcompress.dll ships beside us; this is the same
-         API the Xbox 360 firmware itself uses, so it accepts every
-         chunk Xenia accepts)
+      4. libmspack (lce_lzx.dll) - same decoder Xenia uses; lenient with
+         malformed bitstreams, sweeps window sizes
+      5. Microsoft xcompress64.dll (real XMemDecompress, optional - only
+         attempted if the DLL ships beside us; this is the same API the
+         Xbox 360 firmware itself uses, but it's strict about malformed
+         input and can hit access violations - we wrap it accordingly)
     Raises RuntimeError if every available path fails - the caller will
     drop the chunk and log it.
     """
@@ -419,9 +477,15 @@ def _decompress_region_chunk(xbox_data: bytes) -> bytes:
     if out is not None:
         return out
 
-    # Tier 4: hand off to xcompress.dll if it's present. This is the
+    # Tier 4: libmspack via lce_lzx.dll. Same decoder Xenia uses;
+    # tolerates malformed input by returning errors instead of crashing.
+    out = _try_mspack_chunk(lzx_raw, output_size)
+    if out is not None:
+        return out
+
+    # Tier 5: hand off to xcompress64.dll if it's present. This is the
     # actual Microsoft API; it picks up chunks the open-source decoders
-    # can't follow.
+    # can't follow but is strict about malformed input.
     out = _try_xcompress_chunk(xbox_data, output_size)
     if out is not None:
         return out

@@ -105,6 +105,7 @@ The Xbox 360 save format differs from Win64 in several ways:
 
 - **GoobyCorp** - [LZXDecompression.dll](https://github.com/GoobyCorp/Xbox-360-Crypto) (LDI library for save-level LZX decompression)
 - **Jed Wing / CHMLib** - [lzx.c](https://github.com/jedwing/CHMLib) LZX decoder for region chunk decompression, originally from cabextract
+- **Stuart Caie / libmspack** - [libmspack](https://github.com/kyz/libmspack) LZX decoder used as a fallback tier; bundled inside `lce_lzx.dll` (wrapper source is `lce_lzx.c` in this repo). LGPL.
 - **4J Studios** - Original Minecraft LCE developers
 - **bnnm** - [XNB LZX decompressor gist](https://gist.github.com/bnnm/1d771a406cc2900320fe8df2aa981d12) that documented the chunk framing format
 - **arkem/py360** - [py360](https://github.com/arkem/py360) STFS parsing reference
